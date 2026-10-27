@@ -1,6 +1,6 @@
 # Understanding the starter expert loop
 
-The loop is in `submission.py`, inside `kernel_fn()`.
+This section explains the **original PyTorch starter** loop in `kernel_fn()`. The current `submission.py` replaces that loop with the routed packed-weight pipeline described under [Implemented initial optimization](#implemented-initial-optimization).
 
 Before the loop:
 
@@ -242,3 +242,47 @@ repack weights once
 ```
 
 The timed function includes this entire local computation—not just the final additions. Weight preprocessing in `prepare()` is untimed, and cross-GPU summation is excluded.
+
+## Implemented initial optimization
+
+Work branch: `optimize/routed-marlin`.
+
+`submission.py` now uses installed SGLang/sgl_kernel operators directly. It does not import `baseline.py`, `reference.py`, or a local helper file, so `submission.py` remains the complete submission artifact.
+
+### Changes from the starter
+
+- **Untimed weight repacking:** `prepare()` repacks only experts 0–31 into Marlin's packed NVFP4 layout. It also creates the global-to-local expert map and Marlin workspace. Expanded BF16 expert matrices are not retained.
+- **GPU-side routing:** each call maps global IDs to local indices, marking nonlocal routes with `-1`, then groups routes with `moe_align_block_size`. Routing is recomputed for fresh inputs, without host reads.
+- **Packed GEMMs:** the gate/up and down projections use `moe_wna16_marlin_gemm`, which reconstructs weight tiles within the kernel and processes routed local pairs rather than every token through every expert.
+- **BF16 activation path:** SwiGLU uses the installed masked `silu_and_mul` operator; matrix reductions retain the baseline's FP32 reduction settings.
+- **Fused final stage:** `fused_post_expert_norm_weighted_sum` normalizes each expert output, applies routing weights, and sums, while masking nonlocal slots. Routing weights are not applied inside the GEMMs.
+- **Scratch reuse:** after SwiGLU consumes the gate/up result, the down projection reuses that storage on the same CUDA stream.
+
+The implementation deliberately follows the supplied SGLang baseline's tiling heuristic and operator configuration. This removes the starter's obvious inefficiencies, but **does not establish a speedup over SGLang**. Further tuning should follow actual CUDA-graph measurements, not guesses based on eager timings.
+
+The prepared bank is intentionally limited to the task's EP8 partition, experts 0–31. Other partitions raise a configuration error rather than silently using incorrect weights.
+
+### Validation performed
+
+```bash
+python3 -B -m unittest discover -s muse_moe_w4a16 -p 'test_*.py' -v
+ruff check muse_moe_w4a16/submission.py muse_moe_w4a16/test_submission_contract.py
+git diff --check
+```
+
+Results: **6 contract tests passed**, Ruff passed, and no whitespace errors were reported. All Python files were also compiled from source with Python's `compile()` for syntax validation, without generating bytecode artifacts.
+
+The tests use mocked tensor/operators to check repacking inputs, local routing masks, fresh routing on successive calls, scratch/output dimensions, operator order, FP32 reduction flags, post-normalization weighting, and scored/nearby batch sizes. They also check the submission marker and absence of prohibited reference imports or host tensor reads. **These are wiring tests, not GPU numerical correctness tests.**
+
+### Validation still required
+
+The development environment has Python 3, but no PyTorch, Triton, SGLang, CUDA tooling, or `okc` CLI. No GPU execution, numerical error measurement, CUDA graph capture/replay, or performance benchmark was possible. No official submission was made.
+
+In a configured environment, run:
+
+```bash
+cd muse_moe_w4a16
+okc check submission.py --json
+```
+
+This is the decisive check of the installed operator API, numerical tolerances (including skewed routing), graph compatibility, and performance against SGLang. Inspect its saved profile before choosing the next optimization. No measured speedup is claimed at this stage.
