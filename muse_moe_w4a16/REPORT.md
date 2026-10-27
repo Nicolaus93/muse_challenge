@@ -4,6 +4,7 @@ The loop is in `submission.py`, inside `kernel_fn()`.
 
 Before the loop:
 
+- M is the number of tokens processed in one call—the batch size (config["bs"]).
 - `x`: all token vectors, shape **[M, 4096]**.
 - `ids`: each token’s 8 selected expert IDs, shape **[M, 8]**.
 - `out`: an initially zero FP32 accumulator, shape **[M, 4096]**.
@@ -57,6 +58,74 @@ last 4096 rows:  up weights
 ```
 
 Block scales (`w13_sf`) and the expert’s global scale (`w13_gs`) reconstruct the weight values.
+
+### Number formats: NVFP4 and BF16
+
+These are formats for storing numbers, with different trade-offs between precision and memory.
+
+**BF16 (Brain Floating Point, 16 bits)** uses **2 bytes per number**:
+
+- 1 sign bit.
+- 8 exponent bits, controlling numerical range.
+- 7 fraction bits, controlling precision.
+
+BF16 supports roughly the same numerical range as FP32, but with less precision—roughly **2–3 decimal significant digits**. It is widely used for neural-network computation. In this task, token activations are BF16.
+
+**NVFP4 (NVIDIA’s 4-bit floating-point format)** stores each weight’s code in **4 bits**:
+
+- 1 sign bit.
+- 2 exponent bits.
+- 1 fraction bit.
+
+The code represents one of these values:
+
+```text
+±0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6
+```
+
+To represent useful weight magnitudes, NVFP4 also stores scales:
+
+```text
+weight = code_value × block_scale × global_scale
+```
+
+In this task, there is one FP8 scale per **16 weights**, plus an FP32 global scale per expert matrix. The FP4 code format is also called **E2M1**: two exponent bits and one fraction bit.
+
+| Format | Storage per value | Role here |
+|---|---:|---|
+| FP32 | 4 bytes | Reference computation, global scales, output accumulation |
+| BF16 | 2 bytes | Activations and intermediate matrix outputs |
+| NVFP4 | ½ byte, plus scales | Compressed expert weights |
+
+NVFP4 makes weights much smaller; BF16 provides more precision for computation. **W4A16** means **4-bit weights and 16-bit activations**.
+
+### What dequantization does
+
+`dequantize()` reconstructs numerical weight values from their compressed representation. NVFP4 stores each weight as a **4-bit code**, rather than a full BF16 or FP32 number.
+
+Reconstruction uses:
+
+```text
+weight = decoded_4bit_value × block_scale × global_scale
+```
+
+For example, if a code decodes to `1.5`, the block scale is `128`, and the global scale is `0.0001`, the reconstructed weight is:
+
+```text
+1.5 × 128 × 0.0001 = 0.0192
+```
+
+In this code:
+
+- `weights["w13"][e]` contains packed codes: **two weights per byte**.
+- `weights["w13_sf"][e]` contains **one scale per group of 16 weights**.
+- `weights["w13_gs"][e]` contains **one global scale for this expert’s gate/up matrix**.
+
+`dequantize()` unpacks the codes, decodes them, and applies the scales, returning FP32 values. The following `.to(torch.bfloat16)` converts them to BF16 for matrix multiplication. The same process applies to `w2`.
+
+Compression reduces GPU memory use and data movement. However, the starter expands entire matrices before using them. A faster kernel can reconstruct small tiles during multiplication, avoiding a large expanded matrix in GPU memory.
+
+Dequantization does **not** recover information lost during quantization—it reconstructs the approximation represented by the stored codes and scales.
 
 ## 4. Compute gate and up projections together
 
