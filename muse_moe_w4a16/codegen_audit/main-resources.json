@@ -1,0 +1,48 @@
+{
+  "code": 0,
+  "timed_out": false,
+  "truncated": false,
+  "resources": [],
+  "assembly": {
+    "SASS": {
+      "instruction_count_all_functions": 0,
+      "sha256_instruction_text": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "instruction_histogram_all_functions": {}
+    }
+  },
+  "stderr": "<source>(125): warning #177-D: variable \"okc::NRB\" was declared but never referenced\n  constexpr int NRB = 0 ? 4 : 2;\n                ^\n\nRemark: The warnings can be suppressed with \"-diag-suppress <warning-number>\"\n\n<source>(140): warning #177-D: variable \"okc::UB_A\" was declared but never referenced\n  constexpr int UB_A = RB_A / 16, UB_B = RB_B / 16;\n                ^\n\n<source>(140): warning #177-D: variable \"okc::UB_B\" was declared but never referenced\n  constexpr int UB_A = RB_A / 16, UB_B = RB_B / 16;\n                                  ^\n\n<source>(143): warning #177-D: variable \"okc::BFLAG\" was declared but never referenced\n  constexpr int BFLAG = 1 << 30;\n                ^\n\n<source>(151): warning #177-D: variable \"okc::TWO62\" was declared but never referenced\n  constexpr float TWO62 = 4.611686018427388e18f;\n                  ^\n\n<source>(1643): warning #177-D: variable \"okc::WGS_PIECE\" was declared but never referenced\n  constexpr int WGS_PIECE = 9216;\n                ^\n\n<source>(1649): warning #177-D: variable \"okc::WGS_FIXF\" was declared but never referenced\n  constexpr size_t WGS_FIXF = (size_t)2 * WGS_SLOTS * 4 * WGS_FIXW + 2 * WGS_SLOTS * 4 + 136 * 16;\n                   ^\n\n<source>(1802): warning #177-D: variable \"okc::WGS_XROWS\" was declared but never referenced\n  constexpr int WGS_XROWS = EMAX + 8 * JMAX;\n                ^\n\nptxas info    : 0 bytes gmem",
+  "device_outputs": [
+    "PTX",
+    "SASS"
+  ],
+  "compiler": "nvcc130u1",
+  "variant": "main",
+  "entry": "resources",
+  "experiment": "none",
+  "flags": [
+    "-O3",
+    "-std=c++17",
+    "-gencode=arch=compute_90a,code=sm_90a",
+    "-lineinfo",
+    "-Xptxas=-v,--warn-on-spills",
+    "-D__CUDA_NO_HALF_OPERATORS__",
+    "-D__CUDA_NO_HALF_CONVERSIONS__",
+    "-D__CUDA_NO_BFLOAT16_CONVERSIONS__",
+    "-D__CUDA_NO_HALF2_OPERATORS__",
+    "--expt-relaxed-constexpr",
+    "-DOKC_NS=3",
+    "-DOKC_NSF=3",
+    "-DOKC_DQ7=1",
+    "-DOKC_NW=16",
+    "-DOKC_FAST1=0",
+    "-DOKC_EPI4=0",
+    "-DOKC_WGS=1",
+    "-DOKC_PRMTSC=1"
+  ],
+  "submission_sha256": "dca0eafcc4b0172236498cc3093d93550f12165d914b930eda1db61938184746",
+  "host_resources": {
+    "inspect_dynamic_smem": 231168,
+    "inspect_static_struct": 22232,
+    "inspect_threads": 576
+  }
+}

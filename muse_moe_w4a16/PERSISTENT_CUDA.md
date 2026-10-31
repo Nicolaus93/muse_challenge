@@ -134,6 +134,14 @@ are not claimed as executed. Official checks execute GPU correctness and graph
 replays, including nearby/skewed cases, but not every optional edge scenario.
 Static review is recorded in `reviews/persistent-cuda-static-review.md`.
 
+## Compiled-code inspection
+
+See [CODEGEN_AUDIT.md](CODEGEN_AUDIT.md) for Compiler Explorer inspection with
+NVCC macros matching 13.0.88. Small variants compile without spills; the full
+WGMMA variant exceeds the public service's processing-time limit. Candidate
+helper-indexing/shared-memory changes are inspection-only, not changes to this
+scored implementation and not measured GPU speedups.
+
 ## Limitations and next work
 
 - Mutable scratch/barrier state is for serial launches on one stream. Concurrent
