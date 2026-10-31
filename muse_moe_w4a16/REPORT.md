@@ -1,6 +1,53 @@
+# Column-major Split-K experiment
+
+Branch: `optimize/column-major-splitk`.
+
+The current `submission.py` implements the scheduling ideas from
+[Accelerating MoE model inference with Locality-Aware Kernel Design](https://pytorch.org/blog/accelerating-moe-model/).
+The Marlin implementation described below is historical and remains available
+on `optimize/routed-marlin`.
+
+## Implementation
+
+- Both projections use a custom Triton NVFP4 GEMM. Contiguous CTAs traverse
+  expert-grouped M tiles before advancing N (column-major scheduling).
+- The device's actual padded route count compacts useful CTAs at the front of
+  the launch. Routing and scheduling never read input values on the host.
+- Decode-sized batches use four contiguous K partitions; larger batches use
+  one. This is a shape-only initial heuristic, not an autotuned configuration.
+- Split-K partials accumulate in FP32 scratch and reduce deterministically;
+  there are no BF16 atomics or partially rounded GEMM outputs.
+- The first reduction fuses SwiGLU, rounding gate/up to BF16 before activation
+  and the intermediate to BF16 before the down projection.
+- The second reduction rounds to BF16, followed by the existing per-expert
+  normalization and routing-weighted sum. Nonlocal slots are masked before
+  reading partial scratch and explicitly written as zero by reducers.
+- `prepare()` preserves original packed NVFP4 weights and FP8/FP32 scales.
+  Only tiles are decoded to BF16 inside the timed GEMM. No expanded weight
+  bank or input-derived cache is retained.
+
+## Validation and limitations
+
+Seven CPU wiring/encoding tests pass. They do not execute Triton arithmetic.
+
+Official off-board H200 check `18d326dad5444fc1` passed all five correctness
+cases and all six benchmark cases, including CUDA graph replay. Test relative
+L2 errors were 0.567–0.579%, below the 1.5% bound. No scored submission was made.
+The first check exposed an FP8 masked-load constant typing issue, fixed by
+using a floating-point zero.
+
+**This implementation is experimental, not a speedup over Marlin.** The final
+check reports aggregate speedup 0.1976 versus SGLang (roughly five times slower).
+The saved profile is `profiles/submission.18d326dad5444fc1.txt`; the custom GEMMs
+still dominate. Tile decoding/layout, redundant scale loads, launch occupancy,
+and the Split-K heuristic need further work before replacing Marlin in a
+performance-sensitive deployment. The article compares against older FP16
+Triton kernels, not this already optimized NVFP4 Marlin baseline.
+
 # Understanding the starter expert loop
 
-This section explains the **original PyTorch starter** loop in `kernel_fn()`. The current `submission.py` replaces that loop with the routed packed-weight pipeline described under [Implemented initial optimization](#implemented-initial-optimization).
+This section explains the **original PyTorch starter** loop in `kernel_fn()`.
+The following initial-optimization notes describe the prior Marlin version.
 
 Before the loop:
 

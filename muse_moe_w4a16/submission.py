@@ -1,56 +1,47 @@
 # okc: problem=muse_moe_w4a16
-"""Routed NVFP4 experts using SGLang's packed-weight Marlin operators.
+"""Column-major, Split-K routed GEMMs with tile-local NVFP4 decoding.
 
-Unlike the PyTorch starter, GEMMs visit only routed local token/expert pairs
-and dequantize weight tiles inside the matrix kernel. prepare() repacks the
-32 local experts once; no expanded BF16 weight matrices are retained.
-
-This initial implementation follows the supplied SGLang baseline pipeline.
-It is an optimization over the starter, not a claimed speedup over SGLang.
+Adapted from https://pytorch.org/blog/accelerating-moe-model/ . Unlike
+that FP16 example, partial sums live in FP32 scratch (not BF16 atomics),
+weights remain packed NVFP4, and all activation boundaries remain BF16.
 """
 
-from types import SimpleNamespace
 from typing import TypedDict
 
 import torch
-from sgl_kernel.scalar_type import scalar_types
-from sglang.kernels.ops.activation.activation import silu_and_mul
-from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
+import triton
+import triton.language as tl
 from sglang.kernels.ops.muse_spark_v12.fused_post_expert_norm_weighted_sum_triton import (
     fused_post_expert_norm_weighted_sum,
 )
 from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
-from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
-from sglang.srt.layers.quantization.marlin_utils_fp4 import (
-    prepare_moe_nvfp4_layer_for_marlin,
-)
 
 
 class Weights(TypedDict):
-    w13: torch.Tensor          # uint8 [256, 2I, H/2], gate rows [0, I) then up rows [I, 2I), packed E2M1
+    w13: torch.Tensor          # uint8 [256, 2I, H/2], low nibble first
     w13_sf: torch.Tensor       # float8_e4m3fn [256, 2I, H/16]
     w13_gs: torch.Tensor       # float32 [256]
     w2: torch.Tensor           # uint8 [256, H, I/2]
     w2_sf: torch.Tensor        # float8_e4m3fn [256, H, I/16]
     w2_gs: torch.Tensor        # float32 [256]
-    post_norm_w: torch.Tensor  # bfloat16 [H], the post-expert RMSNorm's weight (applied as 1 + w)
+    post_norm_w: torch.Tensor  # bfloat16 [H]
 
 
 class Config(TypedDict):
-    bs: int           # tokens, M
-    d_hidden: int     # H = 4096, the width the MoE block runs its experts at
-    d_expert: int     # I = 4096
-    n_experts: int    # 256 experts in the model
-    local_start: int  # this GPU computes experts [local_start, local_start + local_count)
-    local_count: int  # 32: one GPU under 8-way expert parallelism
-    top_k: int        # 8
-    sharding: str     # "ep8"
+    bs: int
+    d_hidden: int
+    d_expert: int
+    n_experts: int
+    local_start: int
+    local_count: int
+    top_k: int
+    sharding: str
 
 
 class Inputs(TypedDict):
     hidden_states: torch.Tensor  # bfloat16 [M, H]
-    topk_ids: torch.Tensor       # int32 [M, 8], global expert ids (0-255)
-    topk_weights: torch.Tensor   # float32 [M, 8]
+    topk_ids: torch.Tensor       # int32 [M, top_k], global ids
+    topk_weights: torch.Tensor   # float32 [M, top_k]
     config: Config
 
 
@@ -62,140 +53,193 @@ class State(TypedDict):
     w2_s: torch.Tensor
     w2_gs: torch.Tensor
     expert_map: torch.Tensor
-    workspace: torch.Tensor
     norm_w: torch.Tensor
-    n_experts: int
     local_start: int
     local_count: int
-    d_hidden: int
     d_expert: int
 
 
 LOCAL_START = 0
 LOCAL_COUNT = 32
-BLOCK_SIZE_M_CANDIDATES = (8, 16, 32, 48, 64)
 POST_NORM_EPS = 1e-8
 
 
 def prepare(weights: Weights) -> State:
-    """Repack the EP8 bank once, preserving the packed NVFP4 representation.
-
-    The task places experts 0-31 on this GPU. No routing or activation data is
-    available here or cached in state. Marlin's helper also permutes scales
-    into the layout its GEMMs expect.
-    """
+    """Keep only the local bank, in the original lossless packed layout."""
     local = slice(LOCAL_START, LOCAL_START + LOCAL_COUNT)
-    d_expert = weights["w13"].shape[1] // 2
-    n_experts = weights["w13"].shape[0]
     device = weights["w13"].device
-    layer = SimpleNamespace(
-        quant_config=SimpleNamespace(group_size=16),
-        moe_runner_config=SimpleNamespace(is_gated=True),
-        intermediate_size_per_partition=d_expert,
-        params_dtype=torch.bfloat16,
-        w13_weight=weights["w13"][local].contiguous(),
-        w2_weight=weights["w2"][local].contiguous(),
-        w13_weight_scale=weights["w13_sf"][local].contiguous(),
-        w2_weight_scale=weights["w2_sf"][local].contiguous(),
-        w13_weight_scale_2=weights["w13_gs"][local].contiguous(),
-        w2_weight_scale_2=weights["w2_gs"][local].contiguous(),
+    expert_map = torch.full(
+        (weights["w13"].shape[0],), -1, dtype=torch.int32, device=device
     )
-    prepare_moe_nvfp4_layer_for_marlin(layer)
-
-    # Global IDs map to local bank indices; -1 marks routes owned elsewhere.
-    expert_map = torch.full((n_experts,), -1, dtype=torch.int32, device=device)
     expert_map[local] = torch.arange(LOCAL_COUNT, dtype=torch.int32, device=device)
     return {
-        "w13": layer.w13_weight.data,
-        "w13_s": layer.w13_weight_scale.data,
-        "w13_gs": layer.w13_weight_scale_2.data,
-        "w2": layer.w2_weight.data,
-        "w2_s": layer.w2_weight_scale.data,
-        "w2_gs": layer.w2_weight_scale_2.data,
+        "w13": weights["w13"][local].contiguous(),
+        "w13_s": weights["w13_sf"][local].contiguous(),
+        "w13_gs": weights["w13_gs"][local].contiguous(),
+        "w2": weights["w2"][local].contiguous(),
+        "w2_s": weights["w2_sf"][local].contiguous(),
+        "w2_gs": weights["w2_gs"][local].contiguous(),
         "expert_map": expert_map,
-        "workspace": marlin_make_workspace(device, max_blocks_per_sm=4),
-        # Match SGLang's BF16 effective post-expert norm weight.
         "norm_w": (weights["post_norm_w"].float() + 1.0).to(torch.bfloat16),
-        "n_experts": n_experts,
         "local_start": LOCAL_START,
         "local_count": LOCAL_COUNT,
-        "d_hidden": weights["w2"].shape[1],
-        "d_expert": d_expert,
+        "d_expert": weights["w13"].shape[1] // 2,
     }
 
 
-def _block_size_m(num_tokens: int, top_k: int, local_count: int) -> int:
-    """Use the baseline's shape-only tiling heuristic, including nearby sizes."""
-    for block_size in BLOCK_SIZE_M_CANDIDATES:
-        if num_tokens * top_k / local_count / block_size < 0.9:
-            return block_size
-    return BLOCK_SIZE_M_CANDIDATES[-1]
+@triton.jit
+def _routed_gemm(
+    X, W, SF, GS, Sorted, Experts, Padded, Partial,
+    SLOTS: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+    TOP_K: tl.constexpr,
+    SPLIT_K: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
+    BK: tl.constexpr,
+):
+    # Column-major: consecutive CTAs traverse routed M tiles before advancing
+    # N, so all token tiles of an expert reuse the same weight columns in L2.
+    # Compact the useful CTAs at the beginning of the launch rather than
+    # interleaving every N tile with worst-case padding/empty expert blocks.
+    active_m_tiles = tl.cdiv(tl.load(Padded), BM)
+    if tl.program_id(0) >= active_m_tiles * tl.cdiv(N, BN):
+        return
+    tile_m = tl.program_id(0) % active_m_tiles
+    tile_n = tl.program_id(0) // active_m_tiles
+    split = tl.program_id(1)
+    expert = tl.load(Experts + tile_m)
+    if expert < 0:
+        return
+    rows = tile_m * BM + tl.arange(0, BM)
+    slots = tl.load(Sorted + rows)
+    cols = tile_n * BN + tl.arange(0, BN)
+    ks = tl.arange(0, BK)
+    gs = tl.load(GS + expert)
+    acc = tl.full((BM, BN), 0, tl.float32)
+    # Disjoint contiguous K partitions. The scratch reduction below avoids
+    # nondeterministic atomics and rounds to BF16 only after all splits sum.
+    for step in range(triton.cdiv(K, BK * SPLIT_K)):
+        k = (split * triton.cdiv(K, BK * SPLIT_K) + step) * BK + ks
+        a = tl.load(
+            X + (slots[:, None] // TOP_K) * K + k[None, :],
+            (slots[:, None] < SLOTS) & (k[None, :] < K), other=0,
+        )
+        packed = tl.load(
+            W + expert * N * (K // 2) + cols[:, None] * (K // 2)
+            + k[None, :] // 2,
+            (cols[:, None] < N) & (k[None, :] < K), other=0,
+        ).to(tl.int32)
+        code = (packed >> ((k[None, :] % 2) * 4)) & 15
+        mag = code & 7
+        # E2M1: 0, .5, 1, 1.5, 2, 3, 4, 6; bit 3 is sign.
+        value = tl.where(
+            mag < 2, mag.to(tl.float32) * 0.5,
+            (((mag // 2 + 126) << 23) | ((mag & 1) << 22))
+            .to(tl.float32, bitcast=True),
+        )
+        value = tl.where((code & 8) != 0, -value, value)
+        sf = tl.load(
+            SF + expert * N * (K // 16) + cols[:, None] * (K // 16)
+            + k[None, :] // 16,
+            (cols[:, None] < N) & (k[None, :] < K), other=0.0,
+        ).to(tl.float32)
+        b = (value * (sf * gs)).to(tl.bfloat16)
+        acc = tl.dot(a, tl.trans(b), acc)
+    tl.store(
+        Partial + split * SLOTS * N + slots[:, None] * N + cols[None, :],
+        acc, (slots[:, None] < SLOTS) & (cols[None, :] < N),
+    )
+
+
+@triton.jit
+def _reduce_swiglu(
+    Partial, LocalIds, Inter,
+    SLOTS: tl.constexpr, I: tl.constexpr, SPLIT_K: tl.constexpr,  # noqa: E741
+    BLOCK: tl.constexpr,
+):
+    slot = tl.program_id(0)
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    splits = tl.arange(0, SPLIT_K)
+    local = tl.load(LocalIds + slot) >= 0
+    offset = splits[:, None] * SLOTS * (2 * I) + slot * (2 * I) + cols[None, :]
+    gate = tl.sum(tl.load(Partial + offset, local & (cols[None, :] < I), other=0), 0)
+    up = tl.sum(tl.load(Partial + offset + I, local & (cols[None, :] < I), other=0), 0)
+    # Match both GEMM output rounding and the BF16 SwiGLU boundary.
+    gate = gate.to(tl.bfloat16).to(tl.float32)
+    up = up.to(tl.bfloat16).to(tl.float32)
+    inter = gate / (1.0 + tl.exp(-gate)) * up
+    tl.store(Inter + slot * I + cols, inter, cols < I)
+
+
+@triton.jit
+def _reduce_down(
+    Partial, LocalIds, Y,
+    SLOTS: tl.constexpr, H: tl.constexpr, SPLIT_K: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    slot = tl.program_id(0)
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    splits = tl.arange(0, SPLIT_K)
+    local = tl.load(LocalIds + slot) >= 0
+    offset = splits[:, None] * SLOTS * H + slot * H + cols[None, :]
+    value = tl.sum(tl.load(Partial + offset, local & (cols[None, :] < H), other=0), 0)
+    tl.store(Y + slot * H + cols, value, cols < H)
+
+
+def _split_k(num_tokens: int) -> int:
+    # A conservative shape-only starting point; tune with cold-L2 graph replays.
+    return 4 if num_tokens <= 32 else 1
+
+
+def _launch_gemm(x, state, prefix, sorted_ids, experts, padded, slots, n, k, top_k, split_k):
+    bm, bn, bk = 16, 64, 64
+    m_tiles = min(slots, triton.cdiv(sorted_ids.shape[0], bm))
+    partial = torch.empty((split_k, slots, n), dtype=torch.float32, device=x.device)
+    _routed_gemm[(m_tiles * triton.cdiv(n, bn), split_k)](
+        x, state[prefix], state[prefix + "_s"], state[prefix + "_gs"],
+        sorted_ids, experts, padded, partial,
+        SLOTS=slots, N=n, K=k, TOP_K=top_k,
+        SPLIT_K=split_k, BM=bm, BN=bn, BK=bk,
+        num_warps=4, num_stages=3,
+    )
+    return partial
 
 
 def kernel_fn(data: Inputs, state: State) -> torch.Tensor:
-    """Compute this GPU's routed expert contribution as BF16 [M, H].
-
-    All routing decisions stay on device. Allocations depend only on shapes;
-    nonlocal slots may be unwritten scratch and must be masked by every
-    consumer. Do not move routing weights into either GEMM: normalization
-    must occur before the weighted sum.
-    """
+    """Fresh device-side routes, two packed GEMMs, then per-expert norm/sum."""
     cfg = data["config"]
     if (cfg["local_start"], cfg["local_count"]) != (
         state["local_start"], state["local_count"]
     ):
         raise ValueError("prepare() packs only the task's EP8 experts 0-31")
-
     x = data["hidden_states"].contiguous()
-    num_tokens, size_k = x.shape
-    size_n = state["d_expert"]
+    num_tokens, hidden = x.shape
+    width = state["d_expert"]
     top_k = cfg["top_k"]
-    gemm1_n = 2 * size_n
-    local_ids = state["expert_map"][data["topk_ids"].to(torch.int32)].contiguous()
-    topk_weights = data["topk_weights"].to(torch.float32).contiguous()
-    block_size_m = _block_size_m(num_tokens, top_k, state["local_count"])
-    sorted_ids, block_experts, n_padded = moe_align_block_size(
-        local_ids, block_size_m, state["n_experts"]
-    )
-
-    # Keep the baseline's scratch aliasing: h is dead once SwiGLU completes,
-    # so the down projection can reuse its storage on the same CUDA stream.
     slots = num_tokens * top_k
-    inter = torch.empty((slots, size_n), device=x.device, dtype=x.dtype)
-    scratch = torch.empty(
-        (slots * max(gemm1_n, size_k),), device=x.device, dtype=x.dtype
+    local_ids = state["expert_map"][data["topk_ids"].to(torch.int32)].contiguous()
+    weights = data["topk_weights"].to(torch.float32).contiguous()
+    # Use the same block height as the tensor-core GEMMs. The aligner skips
+    # nonlocal (-1) routes; empty/padded blocks are skipped in the GEMM.
+    sorted_ids, experts, padded = moe_align_block_size(local_ids, 16, LOCAL_COUNT)
+    split_k = _split_k(num_tokens)
+    partial = _launch_gemm(
+        x, state, "w13", sorted_ids, experts, padded,
+        slots, 2 * width, hidden, top_k, split_k,
     )
-    h = scratch[: slots * gemm1_n].view(slots, gemm1_n)
-    y = scratch[: slots * size_k].view(slots, size_k)
-    common = dict(
-        moe_block_size=block_size_m,
-        mul_topk_weights=False,
-        is_ep=True,
-        b_q_type=scalar_types.float4_e2m1f,
-        is_k_full=True,
-        use_atomic_add=False,
-        use_fp32_reduce=True,
-        is_zp_float=False,
+    inter = torch.empty((slots, width), device=x.device, dtype=torch.bfloat16)
+    _reduce_swiglu[(slots, triton.cdiv(width, 256))](
+        partial, local_ids, inter,
+        SLOTS=slots, I=width, SPLIT_K=split_k, BLOCK=256,
     )
-    h = moe_wna16_marlin_gemm(
-        x, h, state["w13"], None, state["w13_s"], state["w13_gs"],
-        None, None, None, state["workspace"],
-        sorted_ids, block_experts, n_padded, topk_weights,
-        top_k=top_k, size_m=num_tokens, size_n=gemm1_n, size_k=size_k,
-        **common,
+    down = _launch_gemm(
+        inter, state, "w2", sorted_ids, experts, padded,
+        slots, hidden, width, 1, split_k,
     )
-    silu_and_mul(h, inter, expert_ids=local_ids.view(-1), expert_step=1)
-    y = moe_wna16_marlin_gemm(
-        inter, y, state["w2"], None, state["w2_s"], state["w2_gs"],
-        None, None, None, state["workspace"],
-        sorted_ids, block_experts, n_padded, topk_weights,
-        top_k=1, size_m=slots, size_n=size_k, size_k=size_n,
-        **common,
-    ).view(num_tokens, top_k, size_k)
+    y = torch.empty((num_tokens, top_k, hidden), device=x.device, dtype=torch.bfloat16)
+    _reduce_down[(slots, triton.cdiv(hidden, 256))](
+        down, local_ids, y,
+        SLOTS=slots, H=hidden, SPLIT_K=split_k, BLOCK=256,
+    )
     return fused_post_expert_norm_weighted_sum(
-        y, topk_weights,
-        norm_weight=state["norm_w"],
-        eps=POST_NORM_EPS,
-        weight_first=True,
-        slot_expert_ids=local_ids,
+        y, weights, norm_weight=state["norm_w"], eps=POST_NORM_EPS,
+        weight_first=True, slot_expert_ids=local_ids,
     )

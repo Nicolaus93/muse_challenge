@@ -10,7 +10,7 @@ import importlib.util
 import math
 from pathlib import Path
 import sys
-from types import ModuleType, SimpleNamespace
+from types import ModuleType
 import unittest
 from unittest.mock import patch
 
@@ -72,26 +72,9 @@ def module(name, **attributes):
 class SubmissionContractTests(unittest.TestCase):
     def setUp(self):
         self.calls = []
-        self.packed = {}
-
-        def repack(layer):
-            self.calls.append(("repack", layer))
-            for name in (
-                "w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale",
-                "w13_weight_scale_2", "w2_weight_scale_2",
-            ):
-                self.packed[name] = layer.__dict__[name]
-
         def align(ids, block_size, n_experts):
             self.calls.append(("align", ids, block_size, n_experts))
             return Tensor((1,), "int32"), Tensor((1,), "int32"), Tensor((1,), "int32")
-
-        def gemm(*args, **kwargs):
-            self.calls.append(("gemm", args, kwargs))
-            return args[1]
-
-        def silu(h, inter, **kwargs):
-            self.calls.append(("silu", h, inter, kwargs))
 
         def norm(y, weights, **kwargs):
             self.calls.append(("norm", y, weights, kwargs))
@@ -103,28 +86,24 @@ class SubmissionContractTests(unittest.TestCase):
             arange=lambda count, **kw: Tensor((count,), kw["dtype"], list(range(count))),
             empty=lambda shape, **kw: Tensor(shape, kw["dtype"]),
         )
+        class JitKernel:
+            def __init__(kernel, fn):
+                kernel.name = fn.__name__
+
+            def __getitem__(kernel, grid):
+                def launch(*args, **kwargs):
+                    self.calls.append((kernel.name, args, kwargs, grid))
+                return launch
+
         dependencies = {
             "torch": torch,
-            "sgl_kernel.scalar_type": module(
-                "sgl_kernel.scalar_type", scalar_types=SimpleNamespace(float4_e2m1f="fp4")
-            ),
-            "sglang.kernels.ops.activation.activation": module(
-                "activation", silu_and_mul=silu
-            ),
-            "sglang.kernels.ops.moe.moe_wna16_marlin": module(
-                "marlin", moe_wna16_marlin_gemm=gemm
-            ),
+            "triton": module("triton", jit=JitKernel, cdiv=lambda a, b: (a + b - 1) // b),
+            "triton.language": module("triton.language", constexpr=int),
             "sglang.kernels.ops.muse_spark_v12.fused_post_expert_norm_weighted_sum_triton": module(
                 "norm", fused_post_expert_norm_weighted_sum=norm
             ),
             "sglang.srt.layers.moe.fused_moe_triton": module(
                 "align", moe_align_block_size=align
-            ),
-            "sglang.srt.layers.quantization.marlin_utils": module(
-                "workspace", marlin_make_workspace=lambda *a, **kw: Tensor((1,), "int32")
-            ),
-            "sglang.srt.layers.quantization.marlin_utils_fp4": module(
-                "repack", prepare_moe_nvfp4_layer_for_marlin=repack
             ),
         }
         with patch.dict(sys.modules, dependencies):
@@ -151,15 +130,13 @@ class SubmissionContractTests(unittest.TestCase):
             "config": {"local_start": 0, "local_count": 32, "top_k": 8},
         }
 
-    def test_prepare_repacks_local_bank_once(self):
-        repacks = [c for c in self.calls if c[0] == "repack"]
-        self.assertEqual(len(repacks), 1)
-        layer = repacks[0][1]
-        self.assertEqual(layer.w13_weight.shape, (32, 8192, 2048))
-        self.assertEqual(layer.w2_weight.shape, (32, 4096, 2048))
-        self.assertEqual(layer.quant_config.group_size, 16)
+    def test_prepare_preserves_local_packed_bank(self):
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.state["w13"].shape, (32, 8192, 2048))
+        self.assertEqual(self.state["w2"].shape, (32, 4096, 2048))
+        self.assertEqual(self.state["w13"].dtype, "uint8")
+        self.assertEqual(self.state["w13_s"].dtype, "float8_e4m3fn")
         self.assertEqual(self.state["expert_map"].values, list(range(32)) + [-1] * 224)
-        self.assertIs(self.state["w13"], self.packed["w13_weight"])
         self.assertEqual(self.state["norm_w"].dtype, "bfloat16")
 
     def test_pipeline_shapes_and_masks_for_scored_and_nearby_batches(self):
@@ -169,24 +146,28 @@ class SubmissionContractTests(unittest.TestCase):
                 output = self.submission.kernel_fn(self.inputs(bs), self.state)
                 self.assertEqual(output.shape, (bs, 4096))
                 self.assertEqual(output.dtype, "bfloat16")
-                self.assertEqual([c[0] for c in self.calls], ["align", "gemm", "silu", "gemm", "norm"])
+                self.assertEqual([c[0] for c in self.calls], [
+                    "align", "_routed_gemm", "_reduce_swiglu",
+                    "_routed_gemm", "_reduce_down", "norm",
+                ])
+                self.assertEqual(self.calls[0][2:], (16, 32))
                 ids = self.calls[0][1]
                 self.assertEqual(ids.values, [[0, 31, -1, -1, 7, 9, -1, -1]] * bs)
                 first, second = self.calls[1], self.calls[3]
                 self.assertEqual(first[1][0].shape, (bs, 4096))
-                self.assertEqual(first[1][1].shape, (bs * 8, 8192))
-                self.assertEqual(first[2]["top_k"], 8)
-                self.assertEqual(first[2]["size_m"], bs)
+                split_k = 4 if bs <= 32 else 1
+                self.assertEqual(first[1][7].shape, (split_k, bs * 8, 8192))
+                self.assertEqual(first[1][7].dtype, "float32")
+                self.assertEqual(first[2]["TOP_K"], 8)
                 self.assertEqual(second[1][0].shape, (bs * 8, 4096))
-                self.assertEqual(second[1][1].shape, (bs * 8, 4096))
-                self.assertEqual(second[2]["top_k"], 1)
-                self.assertEqual(second[2]["size_m"], bs * 8)
+                self.assertEqual(second[1][7].shape, (split_k, bs * 8, 4096))
+                self.assertEqual(second[2]["TOP_K"], 1)
                 for call in (first, second):
-                    self.assertTrue(call[2]["use_fp32_reduce"])
-                    self.assertTrue(call[2]["is_ep"])
-                    self.assertFalse(call[2]["mul_topk_weights"])
-                    self.assertFalse(call[2]["use_atomic_add"])
-                self.assertEqual(self.calls[2][3]["expert_ids"].values, [v for row in ids.values for v in row])
+                    self.assertEqual(call[2]["SLOTS"], bs * 8)
+                    self.assertEqual(call[2]["SPLIT_K"], split_k)
+                    self.assertEqual(call[2]["BM"], 16)
+                self.assertIs(self.calls[2][1][1], ids)
+                self.assertIs(self.calls[4][1][1], ids)
                 final = self.calls[-1]
                 self.assertIs(final[3]["slot_expert_ids"], ids)
                 self.assertTrue(final[3]["weight_first"])
@@ -205,14 +186,29 @@ class SubmissionContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "EP8"):
             self.submission.kernel_fn(data, self.state)
 
-    def test_tiling_heuristic_uses_only_shape(self):
+    def test_split_k_uses_only_shape(self):
         for bs in (1, 4, 8, 16, 32, 33, 128, 256, 257, 1024):
-            expected = 64
-            for block in (8, 16, 32, 48, 64):
-                if bs * 8 / 32 / block < 0.9:
-                    expected = block
-                    break
-            self.assertEqual(self.submission._block_size_m(bs, 8, 32), expected)
+            self.assertEqual(self.submission._split_k(bs), 4 if bs <= 32 else 1)
+
+    def test_e2m1_decode_and_split_coverage(self):
+        expected = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+        import struct
+
+        for code in range(16):
+            mag = code & 7
+            bits = ((mag // 2 + 126) << 23) | ((mag & 1) << 22)
+            value = mag * 0.5 if mag < 2 else struct.unpack("f", struct.pack("I", bits))[0]
+            value = -value if code & 8 else value
+            self.assertEqual(value, -expected[mag] if code & 8 else expected[mag])
+        for k in (64, 128, 4096, 4160):
+            for split_k in (1, 4):
+                steps = (k + 64 * split_k - 1) // (64 * split_k)
+                visited = [
+                    (split * steps + step) * 64 + lane
+                    for split in range(split_k) for step in range(steps) for lane in range(64)
+                    if (split * steps + step) * 64 + lane < k
+                ]
+                self.assertEqual(visited, list(range(k)))
 
     def test_no_reference_import_or_host_tensor_reads(self):
         source = SOURCE.read_text()
