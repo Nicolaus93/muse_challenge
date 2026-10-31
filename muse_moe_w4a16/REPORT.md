@@ -37,7 +37,26 @@ Packed NVFP4 weights and their scales remain lossless in `prepare()`. Marlin
 still performs both GEMMs with `use_fp32_reduce=True`, `use_atomic_add=False`,
 and BF16 activation/output boundaries. Scratch aliasing is preserved.
 
-## Official measurements
+## Official scored submission
+
+Submitted commit `aad98b4` as job `6051d2d18d6341d7` on H200. All five
+correctness tests and six benchmark cases passed, with no flags or rejections.
+Aggregate speedup: **1.31055x**, 95% interval **[1.29090, 1.33021]**.
+This agrees with the preceding off-board check. Leaderboard rank at retrieval:
+**1025** (provisional).
+
+| Load | SGLang | Submission | Speedup |
+|---|---:|---:|---:|
+| decode 1 | 79.12 us | 49.87 us | 1.586x |
+| decode 16 | 192.27 us | 151.39 us | 1.270x |
+| decode 32 | 200.00 us | 195.48 us | 1.023x |
+| verify 1 | 147.28 us | 109.96 us | 1.339x |
+| verify 16 | 468.75 us | 339.98 us | 1.379x |
+| verify 32 | 633.63 us | 476.04 us | 1.331x |
+
+Full profile: `profiles/submission.6051d2d18d6341d7.txt`.
+
+## Official check measurements
 
 Original routed-Marlin check `efcd6c0b0b5b4110` passed and reported aggregate
 speedup 1.0016 versus the supplied SGLang baseline (effectively identical).
@@ -72,7 +91,8 @@ Additional checks:
   rejected to avoid unnecessary specialization.
 
 Reports are under `profiles/submission.<job>.txt`; a compact final result is
-in `results/marlin-local-routing.json`. No scored submission was made.
+in `results/marlin-local-routing.json`. These checks preceded the scored
+submission reported above.
 
 ## Local validation
 
