@@ -1,66 +1,43 @@
-"""CPU-only wiring tests; these do NOT validate GPU arithmetic or performance.
+"""CPU-only contracts for the attributed persistent CUDA backend.
 
-Run: python3 -B -m unittest discover -s muse_moe_w4a16 -p 'test_*.py' -v
-The fake operators check dimensions, routing masks, and precision flags without
-requiring PyTorch/SGLang in a documentation-only development environment.
+These tests validate dispatch, bit encodings and source structure, not GPU math.
+Official GPU checks and the optional test_persistent_gpu.py cover execution.
 """
 
 import ast
 import importlib.util
 import math
 from pathlib import Path
+import struct
 import sys
 from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-
 SOURCE = Path(__file__).with_name("submission.py")
 
 
 class Tensor:
-    def __init__(self, shape, dtype="bfloat16", values=None):
-        self.shape = tuple(shape)
-        self.dtype = dtype
-        self.device = "cuda:fake"
-        self.values = values
-        self.data = self
+    def __init__(self, shape, dtype="bfloat16", pointer=16):
+        self.shape, self.dtype, self.pointer = tuple(shape), dtype, pointer
+        self.device = SimpleNamespace(index=0)
 
     def contiguous(self):
         return self
 
     def to(self, dtype):
-        return Tensor(self.shape, dtype, self.values)
+        return self if dtype == self.dtype else Tensor(self.shape, dtype, self.pointer)
 
-    def float(self):
-        return self.to("float32")
+    def clone(self):
+        return Tensor(self.shape, self.dtype, 16)
 
-    def __add__(self, other):
-        return Tensor(self.shape, self.dtype)
+    def data_ptr(self):
+        return self.pointer
 
-    def view(self, *shape):
-        if -1 in shape:
-            known = math.prod(s for s in shape if s != -1)
-            shape = tuple(math.prod(self.shape) // known if s == -1 else s for s in shape)
-        assert math.prod(shape) == math.prod(self.shape)
-        values = self.values
-        if values is not None and len(self.shape) == 2 and len(shape) == 1:
-            values = [v for row in values for v in row]
-        return Tensor(shape, self.dtype, values)
-
-    def __getitem__(self, index):
-        if isinstance(index, Tensor):
-            assert len(self.shape) == 1
-            values = [[self.values[i] for i in row] for row in index.values]
-            return Tensor(index.shape, self.dtype, values)
-        if isinstance(index, slice):
-            size = len(range(*index.indices(self.shape[0])))
-            values = None if self.values is None else self.values[index]
-            return Tensor((size, *self.shape[1:]), self.dtype, values)
-        raise AssertionError(f"unexpected fake index: {index}")
-
-    def __setitem__(self, index, value):
-        self.values[index] = value.values
+    def __getitem__(self, key):
+        assert isinstance(key, slice)
+        size = len(range(*key.indices(self.shape[0])))
+        return Tensor((size, *self.shape[1:]), self.dtype, self.pointer)
 
 
 def module(name, **attributes):
@@ -69,198 +46,151 @@ def module(name, **attributes):
     return result
 
 
-class SubmissionContractTests(unittest.TestCase):
+class PersistentContractTests(unittest.TestCase):
     def setUp(self):
-        self.calls = []
-        self.packed = {}
+        self.compiles, self.launches = [], []
 
-        def repack(layer):
-            self.calls.append(("repack", layer))
-            for name in (
-                "w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale",
-                "w13_weight_scale_2", "w2_weight_scale_2",
-            ):
-                self.packed[name] = layer.__dict__[name]
-
-        def align(ids, block_size, n_experts):
-            self.calls.append(("align", ids, block_size, n_experts))
-            return Tensor((1,), "int32"), Tensor((1,), "int32"), Tensor((1,), "int32")
-
-        def gemm(*args, **kwargs):
-            self.calls.append(("gemm", args, kwargs))
-            return args[1]
-
-        def silu(h, inter, **kwargs):
-            self.calls.append(("silu", h, inter, kwargs))
-
-        def norm(y, weights, **kwargs):
-            self.calls.append(("norm", y, weights, kwargs))
-            return Tensor((y.shape[0], y.shape[2]))
+        def load_inline(**kwargs):
+            self.compiles.append(kwargs)
+            return SimpleNamespace(
+                okc_set_pdl=lambda on: None,
+                okc_run=lambda *args: self.launches.append(args),
+            )
 
         torch = module(
             "torch", Tensor=Tensor, bfloat16="bfloat16", int32="int32", float32="float32",
-            full=lambda shape, value, **kw: Tensor(shape, kw["dtype"], [value] * shape[0]),
-            arange=lambda count, **kw: Tensor((count,), kw["dtype"], list(range(count))),
             empty=lambda shape, **kw: Tensor(shape, kw["dtype"]),
+            cuda=SimpleNamespace(get_device_capability=lambda: (9, 0)),
         )
-        class JitKernel:
-            def __init__(kernel, fn):
-                kernel.name = fn.__name__
-
-            def __getitem__(kernel, grid):
-                def launch(*args, **kwargs):
-                    self.calls.append((kernel.name, args, kwargs, grid))
-                    if kernel.name == "_small_batch_routes":
-                        start = kwargs["LOCAL_START"]
-                        count = kwargs["LOCAL_COUNT"]
-                        args[1].values = [
-                            [i - start if start <= i < start + count else -1 for i in row]
-                            for row in args[0].values
-                        ]
-                return launch
-
         dependencies = {
             "torch": torch,
-            "triton": module(
-                "triton", jit=JitKernel, next_power_of_2=lambda n: 1 << (n - 1).bit_length(),
-                cdiv=lambda a, b: (a + b - 1) // b,
-            ),
-            "triton.language": module("triton.language", constexpr=int),
-            "sgl_kernel.scalar_type": module(
-                "sgl_kernel.scalar_type", scalar_types=SimpleNamespace(float4_e2m1f="fp4")
-            ),
-            "sglang.kernels.ops.activation.activation": module(
-                "activation", silu_and_mul=silu
-            ),
-            "sglang.kernels.ops.moe.moe_wna16_marlin": module(
-                "marlin", moe_wna16_marlin_gemm=gemm
-            ),
-            "sglang.kernels.ops.muse_spark_v12.fused_post_expert_norm_weighted_sum_triton": module(
-                "norm", fused_post_expert_norm_weighted_sum=norm
-            ),
-            "sglang.srt.layers.moe.fused_moe_triton": module(
-                "align", moe_align_block_size=align
-            ),
-            "sglang.srt.layers.quantization.marlin_utils": module(
-                "workspace", marlin_make_workspace=lambda *a, **kw: Tensor((1,), "int32")
-            ),
-            "sglang.srt.layers.quantization.marlin_utils_fp4": module(
-                "repack", prepare_moe_nvfp4_layer_for_marlin=repack
-            ),
+            "torch.utils": module("torch.utils"),
+            "torch.utils.cpp_extension": module("torch.utils.cpp_extension", load_inline=load_inline),
         }
         with patch.dict(sys.modules, dependencies):
-            spec = importlib.util.spec_from_file_location("submission_under_test", SOURCE)
+            spec = importlib.util.spec_from_file_location("persistent_under_test", SOURCE)
             self.submission = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(self.submission)
-
-        self.weights = {
-            "w13": Tensor((256, 8192, 2048), "uint8"),
-            "w13_sf": Tensor((256, 8192, 256), "float8_e4m3fn"),
-            "w13_gs": Tensor((256,), "float32"),
-            "w2": Tensor((256, 4096, 2048), "uint8"),
-            "w2_sf": Tensor((256, 4096, 256), "float8_e4m3fn"),
-            "w2_gs": Tensor((256,), "float32"),
-            "post_norm_w": Tensor((4096,)),
+        self.state = {
+            "lo": 0, "cnt": 32, "grid": 132,
+            "w": [object() for _ in range(14)], "scratch": [object() for _ in range(3)],
+            "sfx": ("-DOKC_PRMTSC=1",),
         }
-        self.state = self.submission.prepare(self.weights)
 
-    def inputs(self, bs):
+    def inputs(self, tokens):
         return {
-            "hidden_states": Tensor((bs, 4096)),
-            "topk_ids": Tensor((bs, 8), "int32", [[0, 31, 32, 255, 7, 9, 100, 200]] * bs),
-            "topk_weights": Tensor((bs, 8), "float32"),
+            "hidden_states": Tensor((tokens, 4096)),
+            "topk_ids": Tensor((tokens, 8), "int32"),
+            "topk_weights": Tensor((tokens, 8), "float32"),
             "config": {"local_start": 0, "local_count": 32, "top_k": 8},
         }
 
-    def test_prepare_repacks_local_bank_once(self):
-        repacks = [c for c in self.calls if c[0] == "repack"]
-        self.assertEqual(len(repacks), 1)
-        layer = repacks[0][1]
-        self.assertEqual(layer.w13_weight.shape, (32, 8192, 2048))
-        self.assertEqual(layer.w2_weight.shape, (32, 4096, 2048))
-        self.assertEqual(layer.quant_config.group_size, 16)
-        self.assertEqual(self.state["expert_map"].values, list(range(32)) + [-1] * 224)
-        self.assertIs(self.state["w13"], self.packed["w13_weight"])
-        self.assertEqual(self.state["norm_w"].dtype, "bfloat16")
-
-    def test_pipeline_shapes_and_masks_for_scored_and_nearby_batches(self):
-        for bs in (1, 4, 8, 16, 32, 33, 128, 256, 257):
-            with self.subTest(bs=bs):
-                self.calls.clear()
-                output = self.submission.kernel_fn(self.inputs(bs), self.state)
-                self.assertEqual(output.shape, (bs, 4096))
-                self.assertEqual(output.dtype, "bfloat16")
-                norm_op = "_small_batch_norm_sum" if bs < 32 else "norm"
-                route_op = "_small_batch_routes" if bs <= 32 else "align"
-                self.assertEqual([c[0] for c in self.calls], [route_op, "gemm", "silu", "gemm", norm_op])
-                if bs <= 32:
-                    route = self.calls[0]
-                    self.assertEqual(route[2]["SLOTS"], bs * 8)
-                    self.assertEqual(route[2]["BM"], 8)
-                    self.assertEqual(route[2]["LOCAL_COUNT"], 32)
-                    self.assertEqual(route[3], (1,))
-                    ids = route[1][1]
+    def test_dispatch_scored_nearby_and_chunked_shapes(self):
+        fn = self.submission
+        for tokens in (1, 4, 8, 16, 17, 32, 33, 128, 256, 257, 384, 385, 769):
+            with self.subTest(tokens=tokens):
+                self.launches.clear()
+                out = fn.kernel_fn(self.inputs(tokens), self.state)
+                self.assertEqual(out.shape, (tokens, 4096))
+                self.assertEqual(out.dtype, "bfloat16")
+                self.assertEqual(len(self.launches), math.ceil(tokens / 384))
+                self.assertEqual(sum(a[2].shape[0] for a in self.launches), tokens)
+                for args in self.launches:
+                    self.assertIs(args[0], self.state["w"])
+                    self.assertIs(args[1], self.state["scratch"])
+                    self.assertEqual(args[2].shape[1], 4096)
+                    self.assertEqual(args[3].shape, (args[2].shape[0], 8))
+                    self.assertEqual(args[4].dtype, "float32")
+                    self.assertEqual(args[5].dtype, "bfloat16")
+                    self.assertEqual(args[6:], (0, 32, 132))
+                flags = self.compiles[-1]["extra_cuda_cflags"]
+                if tokens <= 4:
+                    self.assertTrue(all(d in flags for d in fn.TINY_DEFINES))
+                elif tokens <= 8:
+                    self.assertTrue(all(d in flags for d in fn.TINY2_DEFINES))
+                elif tokens <= 16:
+                    self.assertTrue(all(d in flags for d in fn.MID_DEFINES))
                 else:
-                    self.assertEqual(self.calls[0][3], 32)
-                    ids = self.calls[0][1]
-                self.assertEqual(ids.values, [[0, 31, -1, -1, 7, 9, -1, -1]] * bs)
-                first, second = self.calls[1], self.calls[3]
-                self.assertEqual(first[1][0].shape, (bs, 4096))
-                self.assertEqual(first[1][1].shape, (bs * 8, 8192))
-                self.assertEqual(first[2]["top_k"], 8)
-                self.assertEqual(first[2]["size_m"], bs)
-                self.assertEqual(second[1][0].shape, (bs * 8, 4096))
-                self.assertEqual(second[1][1].shape, (bs * 8, 4096))
-                self.assertEqual(second[2]["top_k"], 1)
-                self.assertEqual(second[2]["size_m"], bs * 8)
-                for call in (first, second):
-                    self.assertTrue(call[2]["use_fp32_reduce"])
-                    self.assertTrue(call[2]["is_ep"])
-                    self.assertFalse(call[2]["mul_topk_weights"])
-                    self.assertFalse(call[2]["use_atomic_add"])
-                self.assertEqual(self.calls[2][3]["expert_ids"].values, [v for row in ids.values for v in row])
-                final = self.calls[-1]
-                if bs < 32:
-                    self.assertIs(final[1][3], ids)
-                    self.assertEqual(final[1][4].shape, (bs, 4096))
-                    self.assertEqual(final[2]["TOP_K"], 8)
-                    self.assertEqual(final[2]["EPS"], 1e-8)
-                    self.assertEqual(final[3], (bs,))
-                else:
-                    self.assertIs(final[3]["slot_expert_ids"], ids)
-                    self.assertTrue(final[3]["weight_first"])
-                    self.assertEqual(final[3]["eps"], 1e-8)
+                    self.assertTrue(all(d in flags for d in fn.MAIN_DEFINES))
 
-    def test_routing_is_recomputed_for_each_call(self):
+    def test_only_compiled_code_is_cached(self):
+        fn = self.submission
         data = self.inputs(1)
-        self.submission.kernel_fn(data, self.state)
-        data["topk_ids"].values = [[255] * 8]
-        self.submission.kernel_fn(data, self.state)
-        self.assertEqual(self.calls[-1][1][3].values, [[-1] * 8])
+        first = fn.kernel_fn(data, self.state)
+        data["topk_ids"] = Tensor((1, 8), "int32", pointer=32)
+        second = fn.kernel_fn(data, self.state)
+        self.assertIsNot(first, second)
+        self.assertEqual(len(self.compiles), 1)
+        self.assertEqual(self.launches[-1][3].data_ptr(), 32)
 
-    def test_rejects_unprepared_expert_partition(self):
+    def test_alignment_copy_and_scale_fallback(self):
+        fn = self.submission
+        data = self.inputs(33)
+        data["topk_ids"].pointer = 18
+        fn.kernel_fn(data, self.state)
+        self.assertEqual(self.launches[-1][3].data_ptr(), 16)
+        self.assertEqual(fn._main_defines(()), fn.MAIN_FALLBACK_DEFINES)
+        self.assertNotIn("-DOKC_WGS=1", fn._main_defines(()))
+
+    def test_rejects_invalid_activation_contract(self):
+        fn = self.submission
+        for field, value in (("local_start", 32), ("local_count", 16), ("top_k", 4)):
+            data = self.inputs(1)
+            data["config"][field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                fn.kernel_fn(data, self.state)
         data = self.inputs(1)
-        data["config"]["local_start"] = 32
-        with self.assertRaisesRegex(ValueError, "EP8"):
-            self.submission.kernel_fn(data, self.state)
+        data["hidden_states"].dtype = "float32"
+        with self.assertRaisesRegex(ValueError, "BF16"):
+            fn.kernel_fn(data, self.state)
 
-    def test_tiling_heuristic_uses_only_shape(self):
-        for bs in (1, 4, 8, 16, 32, 33, 128, 256, 257, 1024):
-            expected = 8 if bs <= 32 else 16
-            self.assertEqual(self.submission._block_size_m(bs, 8, 32), expected)
+    def test_dq7_bit_permutation_roundtrips_all_codes(self):
+        positions = self.submission._stored_pos()
+        self.assertEqual(sorted(positions.values()), list(range(32)))
+        mask = 0x81C081C0
+        def rotl(q, n):
+            return ((q << n) | (q >> (32 - n))) & 0xFFFFFFFF
+        for reg in range(4):
+            for upper in range(2):
+                for code in range(16):
+                    packed = sum(((code >> bit) & 1) << positions[reg, upper, bit] for bit in range(4))
+                    decoded = (
+                        packed & mask,
+                        (packed << 4) & mask,
+                        rotl(packed, 10) & mask,
+                        ((packed << 6) & 0x80C080C0) | (rotl(packed, 14) & 0x01000100),
+                    )[reg]
+                    bits = (decoded >> (16 * upper)) & 0xFFFF
+                    scaled = struct.unpack("f", struct.pack("I", bits << 16))[0]
+                    expected = (0, 0.5, 1, 1.5, 2, 3, 4, 6)[code & 7]
+                    if code & 8:
+                        expected = -expected
+                    self.assertEqual(math.ldexp(scaled, 126), expected)
 
-    def test_no_reference_import_or_host_tensor_reads(self):
-        source = SOURCE.read_text()
-        self.assertEqual(source.splitlines()[0], "# okc: problem=muse_moe_w4a16")
-        tree = ast.parse(source)
-        imports = [n for n in ast.walk(tree) if isinstance(n, (ast.Import, ast.ImportFrom))]
-        for node in imports:
-            names = [node.module] if isinstance(node, ast.ImportFrom) else [a.name for a in node.names]
-            self.assertFalse(any(n.split(".")[0] in {"reference", "baseline", "nvfp4"} for n in names))
-        forbidden = {"item", "cpu", "numpy", "tolist", "synchronize", "nonzero"}
+    def test_bf16_boundaries_and_empty_routing_guard_are_explicit(self):
+        src = self.submission.CUDA_SRC
+        self.assertIn("gate = round_bf16(gate);", src)
+        self.assertIn("up = round_bf16(up);", src)
+        self.assertIn("return round_bf16(acc * scale) * round_bf16(norm);", src)
+        self.assertNotIn("SILU_DIV(gt,", src)
+        self.assertEqual(src.count("swiglu_bf16(gt, up)"), 5)
+        self.assertIn("if (nj == 0)", src)
+        self.assertIn("C10_CUDA_KERNEL_LAUNCH_CHECK", src)
+
+    def test_submission_is_self_contained_and_timed_path_has_no_host_reads(self):
+        src = SOURCE.read_text()
+        self.assertEqual(src.splitlines()[0], "# okc: problem=muse_moe_w4a16")
+        tree = ast.parse(src)
         for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                self.assertNotIn(node.module.split(".")[0], {"reference", "baseline", "nvfp4"})
+        kernel = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "kernel_fn")
+        for node in ast.walk(kernel):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-                self.assertNotIn(node.func.attr, forbidden)
+                self.assertNotIn(node.func.attr, {"item", "cpu", "tolist", "numpy", "synchronize"})
+        self.assertNotIn("_time_graph", src)
+        self.assertNotIn("BW_SRC", src)
+        self.assertNotIn("ALT_SRCS", src)
 
 
 if __name__ == "__main__":

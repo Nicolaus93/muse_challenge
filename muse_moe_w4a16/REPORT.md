@@ -1,4 +1,13 @@
-# Improved routed-Marlin pipeline
+# Current backend: persistent CUDA
+
+On `optimize/persistent-cuda-moe`, `submission.py` now contains an attributed
+persistent CUDA backend. See [PERSISTENT_CUDA.md](PERSISTENT_CUDA.md) for its
+provenance, BF16-boundary fixes, limitations and GPU measurements.
+
+The following sections preserve the previous Marlin backend's results. That
+backend remains on `optimize/marlin-local-routing`.
+
+# Improved routed-Marlin pipeline (previous backend)
 
 Branch: `optimize/marlin-local-routing`, based on `optimize/routed-marlin`.
 
