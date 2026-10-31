@@ -69,6 +69,17 @@ bank for positive normal E4M3 scale bytes. Other encodings select the LUT/
 `mma.sync` fallback. Host inspection here is weight-only and in `prepare()`.
 No FP32 reference computation or activation preparation occurs outside timing.
 
+## Scored submission
+
+Submitted implementation `cabcee2` as job `ab48b9ddea894287` on H200.
+All five correctness tests and six benchmark cases passed, with no flags or
+rejections. Aggregate speedup versus SGLang: **2.35454x**, 95% interval
+**[2.31922, 2.38986]**.
+
+Leaderboard at retrieval: **228 of 1256 ranked teams**, up from **1025** for the
+previous Marlin submission (797 places gained). Rankings remain provisional.
+Full scored profile: `profiles/submission.ab48b9ddea894287.txt`.
+
 ## Validation
 
 Final off-board H200 check of implementation commit `cabcee2`:
@@ -95,8 +106,8 @@ Full final profile: `profiles/submission.0f16573f571040a2.txt`.
 The initial integration also passed all tests and benchmarks in check
 `ac6622cf9d104696`: aggregate speedup 2.35177x, interval [2.31649, 2.38705].
 The two runs agree within their reported intervals; the small difference is
-not evidence that host-side cleanup improved performance. No scored submission
-of this backend has been made.
+not evidence that host-side cleanup improved performance. The subsequent scored
+submission is recorded above.
 
 Local validation: seven CPU contract/encoding tests pass; four optional Hopper
 edge tests in `test_persistent_gpu.py` skip because PyTorch/CUDA is absent.
