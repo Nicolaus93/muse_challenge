@@ -2816,6 +2816,12 @@ static int g_okc_pdl = 0;  // launch with programmatic stream serialization (PDL
 
 void okc_set_pdl(int64_t on) { g_okc_pdl = on ? 1 : 0; }
 
+// Host-only metadata from the compiler that builds this CUDA translation unit.
+// No subprocess, device read, or timed-kernel instrumentation is involved.
+std::vector<int64_t> okc_compiler_version() {
+  return {__CUDACC_VER_MAJOR__, __CUDACC_VER_MINOR__, __CUDACC_VER_BUILD__, CUDART_VERSION};
+}
+
 void okc_run(std::vector<torch::Tensor> w, std::vector<torch::Tensor> scratch, torch::Tensor x, torch::Tensor ids,
              torch::Tensor tw, torch::Tensor out, int64_t lo, int64_t nloc, int64_t grid) {
   c10::cuda::CUDAGuard device_guard(x.device());
@@ -2914,6 +2920,7 @@ CPP_SRC = r'''
 void okc_run(std::vector<torch::Tensor> w, std::vector<torch::Tensor> scratch, torch::Tensor x, torch::Tensor ids,
              torch::Tensor tw, torch::Tensor out, int64_t lo, int64_t nloc, int64_t grid);
 void okc_set_pdl(int64_t on);
+std::vector<int64_t> okc_compiler_version();
 '''
 
 
@@ -2940,7 +2947,7 @@ def _ext(defines=None):
             name=f"muse_persistent_bf16_v1_{tag}_sm{arch}",
             cpp_sources=CPP_SRC,
             cuda_sources=src,
-            functions=["okc_run", "okc_set_pdl"],
+            functions=["okc_run", "okc_set_pdl", "okc_compiler_version"],
             extra_cuda_cflags=["-O3", f"-gencode=arch=compute_{arch},code=sm_{arch}", "-lineinfo",
                                *([] if any(d.startswith("-DOKC_NS=") for d in defs) else [f"-DOKC_NS={MAIN_NS if major >= 9 else 1}"]),
                                *([] if any(d.startswith("-DOKC_NSF=") for d in defs) else [f"-DOKC_NSF={3 if major >= 9 else 1}"]), *defs],
@@ -3188,6 +3195,12 @@ def prepare(weights):
             mods.append(tuple(d) + state["sfx"])
     for d in mods:
         _ext(d)
+    major, minor, build, runtime_header = _ext(mods[0]).okc_compiler_version()
+    print(
+        f"[cuda-toolchain] nvcc={major}.{minor}.{build} "
+        f"cudart_header={runtime_header}",
+        flush=True,
+    )
     torch.cuda.synchronize()
     return state
 

@@ -177,6 +177,23 @@ class PersistentContractTests(unittest.TestCase):
         self.assertIn("if (nj == 0)", src)
         self.assertIn("C10_CUDA_KERNEL_LAUNCH_CHECK", src)
 
+    def test_compiler_version_probe_is_only_called_in_prepare(self):
+        fn = self.submission
+        self.assertIn("__CUDACC_VER_MAJOR__", fn.CUDA_SRC)
+        self.assertIn("__CUDACC_VER_MINOR__", fn.CUDA_SRC)
+        self.assertIn("__CUDACC_VER_BUILD__", fn.CUDA_SRC)
+        self.assertIn("CUDART_VERSION", fn.CUDA_SRC)
+        self.assertIn("okc_compiler_version();", fn.CPP_SRC)
+        tree = ast.parse(SOURCE.read_text())
+        callers = [
+            node.name for node in tree.body if isinstance(node, ast.FunctionDef)
+            and any(isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+                    and call.func.attr == "okc_compiler_version" for call in ast.walk(node))
+        ]
+        self.assertEqual(callers, ["prepare"])
+        self.submission.kernel_fn(self.inputs(1), self.state)
+        self.assertIn("okc_compiler_version", self.compiles[0]["functions"])
+
     def test_submission_is_self_contained_and_timed_path_has_no_host_reads(self):
         src = SOURCE.read_text()
         self.assertEqual(src.splitlines()[0], "# okc: problem=muse_moe_w4a16")
