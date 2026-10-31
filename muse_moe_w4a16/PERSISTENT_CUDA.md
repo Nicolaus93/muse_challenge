@@ -71,27 +71,32 @@ No FP32 reference computation or activation preparation occurs outside timing.
 
 ## Validation
 
-Initial off-board H200 check: `ac6622cf9d104696`.
+Final off-board H200 check of implementation commit `cabcee2`:
+`0f16573f571040a2`.
 - All five correctness tests and all six benchmark shapes passed.
 - No rejected or flagged static checks.
-- Correctness-test relative L2 error: 0.445–0.457%, below 1.5%.
-- Aggregate paired speedup versus SGLang: **2.35177x**.
-- 95% interval: **[2.31649, 2.38705]**.
-- Untimed preparation/compilation: about 185 seconds (300-second allowance).
+- Correctness-test relative L2 error: 0.445–0.458%, below 1.5%.
+- Aggregate paired speedup versus SGLang: **2.36131x**.
+- 95% interval: **[2.32589, 2.39673]**.
+- Untimed preparation/compilation: about 182 seconds (300-second allowance).
 - Each scored profile shows one persistent CUDA kernel invocation.
 
 | Tokens | Load | Submission time | Paired speedup vs SGLang |
 |---|---|---:|---:|
-| 1 | decode 1 | 24.78 us | 3.086x |
-| 16 | decode 16 | 94.07 us | 1.977x |
-| 32 | decode 32 | 125.68 us | 1.648x |
-| 8 | verify 1 | 64.46 us | 2.216x |
-| 128 | verify 16 | 177.44 us | 2.599x |
-| 256 | verify 32 | 218.37 us | 2.922x |
+| 1 | decode 1 | 26.27 us | 3.055x |
+| 16 | decode 16 | 95.54 us | 1.974x |
+| 32 | decode 32 | 129.69 us | 1.652x |
+| 8 | verify 1 | 63.63 us | 2.231x |
+| 128 | verify 16 | 178.13 us | 2.639x |
+| 256 | verify 32 | 213.07 us | 2.955x |
 
-Full profile: `profiles/submission.ac6622cf9d104696.txt`.
-A final check of host-side cleanup/error handling is pending:
-`0f16573f571040a2`. No scored submission of this backend has been made.
+Full final profile: `profiles/submission.0f16573f571040a2.txt`.
+
+The initial integration also passed all tests and benchmarks in check
+`ac6622cf9d104696`: aggregate speedup 2.35177x, interval [2.31649, 2.38705].
+The two runs agree within their reported intervals; the small difference is
+not evidence that host-side cleanup improved performance. No scored submission
+of this backend has been made.
 
 Local validation: seven CPU contract/encoding tests pass; four optional Hopper
 edge tests in `test_persistent_gpu.py` skip because PyTorch/CUDA is absent.

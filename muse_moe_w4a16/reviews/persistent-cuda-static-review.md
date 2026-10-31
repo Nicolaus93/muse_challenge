@@ -13,6 +13,12 @@ No additional concrete blocking correctness or compile error was found in the se
 **Issue:** Both `cudaLaunchKernelEx` return values remain unchecked and this branch returns before `C10_CUDA_KERNEL_LAUNCH_CHECK()`. The ordinary launch and attribute checks are fixed. `PDL=False` makes this irrelevant to the current check/timing path.
 **Suggested Fix:** Check each `cudaLaunchKernelEx` result with `C10_CUDA_CHECK` before returning, if retaining the optional PDL mode.
 
+**Integration follow-up:** The optional PDL launch calls are now wrapped in
+`C10_CUDA_CHECK`. Official check `ac6622cf9d104696` subsequently passed GPU
+compilation, correctness and graph replay on H200; this review itself remains
+static-only. Additional host-side cleanup is covered by the final check noted
+in `PERSISTENT_CUDA.md`.
+
 ## Requested correctness checks
 
 - **Zero local routes:** The `nj==0` guard at lines 2344-2347 is sufficient for the traced WGS empty-job path: it avoids `wgs_stage_at`/division, both producers still participate in their initialization joins, producer loops and phase loops are empty, and gather has zero rows. Final reduction sees `pos=-1` and writes zeros without accessing stale `ybuf`. TINY/MID helper paths likewise have zero units, but still execute both helper joins. No early return bypasses the final grid barrier/reset.
