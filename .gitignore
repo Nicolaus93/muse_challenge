@@ -1,3 +1,7 @@
 muse_moe_w4a16/results
 muse_moe_w4a16/profiles
 
+# Local browser profiles may contain cookies, logins, and session credentials.
+/$HOME/brave-pi-profile/
+/brave-pi-profile/
+
