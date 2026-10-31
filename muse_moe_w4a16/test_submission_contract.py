@@ -103,8 +103,21 @@ class SubmissionContractTests(unittest.TestCase):
             arange=lambda count, **kw: Tensor((count,), kw["dtype"], list(range(count))),
             empty=lambda shape, **kw: Tensor(shape, kw["dtype"]),
         )
+        class JitKernel:
+            def __init__(kernel, fn):
+                kernel.name = fn.__name__
+
+            def __getitem__(kernel, grid):
+                def launch(*args, **kwargs):
+                    self.calls.append((kernel.name, args, kwargs, grid))
+                return launch
+
         dependencies = {
             "torch": torch,
+            "triton": module(
+                "triton", jit=JitKernel, next_power_of_2=lambda n: 1 << (n - 1).bit_length()
+            ),
+            "triton.language": module("triton.language", constexpr=int),
             "sgl_kernel.scalar_type": module(
                 "sgl_kernel.scalar_type", scalar_types=SimpleNamespace(float4_e2m1f="fp4")
             ),
@@ -169,7 +182,9 @@ class SubmissionContractTests(unittest.TestCase):
                 output = self.submission.kernel_fn(self.inputs(bs), self.state)
                 self.assertEqual(output.shape, (bs, 4096))
                 self.assertEqual(output.dtype, "bfloat16")
-                self.assertEqual([c[0] for c in self.calls], ["align", "gemm", "silu", "gemm", "norm"])
+                norm_op = "_small_batch_norm_sum" if bs < 32 else "norm"
+                self.assertEqual([c[0] for c in self.calls], ["align", "gemm", "silu", "gemm", norm_op])
+                self.assertEqual(self.calls[0][3], 32)
                 ids = self.calls[0][1]
                 self.assertEqual(ids.values, [[0, 31, -1, -1, 7, 9, -1, -1]] * bs)
                 first, second = self.calls[1], self.calls[3]
@@ -188,16 +203,23 @@ class SubmissionContractTests(unittest.TestCase):
                     self.assertFalse(call[2]["use_atomic_add"])
                 self.assertEqual(self.calls[2][3]["expert_ids"].values, [v for row in ids.values for v in row])
                 final = self.calls[-1]
-                self.assertIs(final[3]["slot_expert_ids"], ids)
-                self.assertTrue(final[3]["weight_first"])
-                self.assertEqual(final[3]["eps"], 1e-8)
+                if bs < 32:
+                    self.assertIs(final[1][3], ids)
+                    self.assertEqual(final[1][4].shape, (bs, 4096))
+                    self.assertEqual(final[2]["TOP_K"], 8)
+                    self.assertEqual(final[2]["EPS"], 1e-8)
+                    self.assertEqual(final[3], (bs,))
+                else:
+                    self.assertIs(final[3]["slot_expert_ids"], ids)
+                    self.assertTrue(final[3]["weight_first"])
+                    self.assertEqual(final[3]["eps"], 1e-8)
 
     def test_routing_is_recomputed_for_each_call(self):
         data = self.inputs(1)
         self.submission.kernel_fn(data, self.state)
         data["topk_ids"].values = [[255] * 8]
         self.submission.kernel_fn(data, self.state)
-        self.assertEqual(self.calls[-1][3]["slot_expert_ids"].values, [[-1] * 8])
+        self.assertEqual(self.calls[-1][1][3].values, [[-1] * 8])
 
     def test_rejects_unprepared_expert_partition(self):
         data = self.inputs(1)

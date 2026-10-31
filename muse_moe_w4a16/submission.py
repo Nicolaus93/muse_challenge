@@ -13,6 +13,8 @@ from types import SimpleNamespace
 from typing import TypedDict
 
 import torch
+import triton
+import triton.language as tl
 from sgl_kernel.scalar_type import scalar_types
 from sglang.kernels.ops.activation.activation import silu_and_mul
 from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
@@ -132,6 +134,45 @@ def _block_size_m(num_tokens: int, top_k: int, local_count: int) -> int:
     return BLOCK_SIZE_M_CANDIDATES[-1]
 
 
+@triton.jit
+def _small_batch_norm_sum(
+    Y, Scores, Norm, LocalIds, Out,
+    H: tl.constexpr, TOP_K: tl.constexpr, BLOCK_H: tl.constexpr,
+    EPS: tl.constexpr,
+):
+    """Avoid SGLang's multi-kernel PyTorch fallback below 32 tokens."""
+    token = tl.program_id(0)
+    cols = tl.arange(0, BLOCK_H)
+    norm = tl.load(Norm + cols, cols < H, other=0).to(tl.float32)
+    acc = tl.full((BLOCK_H,), 0, tl.float32)
+    for route in tl.static_range(TOP_K):
+        slot = token * TOP_K + route
+        # Marlin leaves nonlocal scratch unwritten. Branch before loading it.
+        if tl.load(LocalIds + slot) >= 0:
+            y = tl.load(Y + slot * H + cols, cols < H, other=0).to(tl.float32)
+            z = y * norm
+            inv_rms = tl.rsqrt(tl.sum(z * z, 0) / H + EPS)
+            score = tl.load(Scores + slot)
+            acc += (z * inv_rms) * score
+    tl.store(Out + token * H + cols, acc, cols < H)
+
+
+def _post_norm_sum(y, scores, norm_w, local_ids):
+    tokens, top_k, hidden = y.shape
+    if tokens >= 32:
+        return fused_post_expert_norm_weighted_sum(
+            y, scores, norm_weight=norm_w, eps=POST_NORM_EPS,
+            weight_first=True, slot_expert_ids=local_ids,
+        )
+    out = torch.empty((tokens, hidden), device=y.device, dtype=y.dtype)
+    _small_batch_norm_sum[(tokens,)](
+        y, scores, norm_w, local_ids, out,
+        H=hidden, TOP_K=top_k, BLOCK_H=triton.next_power_of_2(hidden),
+        EPS=POST_NORM_EPS, num_warps=8, num_stages=2,
+    )
+    return out
+
+
 def kernel_fn(data: Inputs, state: State) -> torch.Tensor:
     """Compute this GPU's routed expert contribution as BF16 [M, H].
 
@@ -155,7 +196,7 @@ def kernel_fn(data: Inputs, state: State) -> torch.Tensor:
     topk_weights = data["topk_weights"].to(torch.float32).contiguous()
     block_size_m = _block_size_m(num_tokens, top_k, state["local_count"])
     sorted_ids, block_experts, n_padded = moe_align_block_size(
-        local_ids, block_size_m, state["n_experts"]
+        local_ids, block_size_m, state["local_count"]
     )
 
     # Keep the baseline's scratch aliasing: h is dead once SwiGLU completes,
@@ -192,10 +233,4 @@ def kernel_fn(data: Inputs, state: State) -> torch.Tensor:
         top_k=1, size_m=slots, size_n=size_k, size_k=size_n,
         **common,
     ).view(num_tokens, top_k, size_k)
-    return fused_post_expert_norm_weighted_sum(
-        y, topk_weights,
-        norm_weight=state["norm_w"],
-        eps=POST_NORM_EPS,
-        weight_first=True,
-        slot_expert_ids=local_ids,
-    )
+    return _post_norm_sum(y, topk_weights, state["norm_w"], local_ids)
