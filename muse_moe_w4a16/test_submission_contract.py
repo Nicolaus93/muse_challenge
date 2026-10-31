@@ -110,12 +110,20 @@ class SubmissionContractTests(unittest.TestCase):
             def __getitem__(kernel, grid):
                 def launch(*args, **kwargs):
                     self.calls.append((kernel.name, args, kwargs, grid))
+                    if kernel.name == "_small_batch_routes":
+                        start = kwargs["LOCAL_START"]
+                        count = kwargs["LOCAL_COUNT"]
+                        args[1].values = [
+                            [i - start if start <= i < start + count else -1 for i in row]
+                            for row in args[0].values
+                        ]
                 return launch
 
         dependencies = {
             "torch": torch,
             "triton": module(
-                "triton", jit=JitKernel, next_power_of_2=lambda n: 1 << (n - 1).bit_length()
+                "triton", jit=JitKernel, next_power_of_2=lambda n: 1 << (n - 1).bit_length(),
+                cdiv=lambda a, b: (a + b - 1) // b,
             ),
             "triton.language": module("triton.language", constexpr=int),
             "sgl_kernel.scalar_type": module(
@@ -183,9 +191,18 @@ class SubmissionContractTests(unittest.TestCase):
                 self.assertEqual(output.shape, (bs, 4096))
                 self.assertEqual(output.dtype, "bfloat16")
                 norm_op = "_small_batch_norm_sum" if bs < 32 else "norm"
-                self.assertEqual([c[0] for c in self.calls], ["align", "gemm", "silu", "gemm", norm_op])
-                self.assertEqual(self.calls[0][3], 32)
-                ids = self.calls[0][1]
+                route_op = "_small_batch_routes" if bs <= 32 else "align"
+                self.assertEqual([c[0] for c in self.calls], [route_op, "gemm", "silu", "gemm", norm_op])
+                if bs <= 32:
+                    route = self.calls[0]
+                    self.assertEqual(route[2]["SLOTS"], bs * 8)
+                    self.assertEqual(route[2]["BM"], 8)
+                    self.assertEqual(route[2]["LOCAL_COUNT"], 32)
+                    self.assertEqual(route[3], (1,))
+                    ids = route[1][1]
+                else:
+                    self.assertEqual(self.calls[0][3], 32)
+                    ids = self.calls[0][1]
                 self.assertEqual(ids.values, [[0, 31, -1, -1, 7, 9, -1, -1]] * bs)
                 first, second = self.calls[1], self.calls[3]
                 self.assertEqual(first[1][0].shape, (bs, 4096))
@@ -229,11 +246,7 @@ class SubmissionContractTests(unittest.TestCase):
 
     def test_tiling_heuristic_uses_only_shape(self):
         for bs in (1, 4, 8, 16, 32, 33, 128, 256, 257, 1024):
-            expected = 64
-            for block in (8, 16, 32, 48, 64):
-                if bs * 8 / 32 / block < 0.9:
-                    expected = block
-                    break
+            expected = 8 if bs <= 32 else 16
             self.assertEqual(self.submission._block_size_m(bs, 8, 32), expected)
 
     def test_no_reference_import_or_host_tensor_reads(self):

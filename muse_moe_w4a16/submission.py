@@ -5,8 +5,9 @@ Unlike the PyTorch starter, GEMMs visit only routed local token/expert pairs
 and dequantize weight tiles inside the matrix kernel. prepare() repacks the
 32 local experts once; no expanded BF16 weight matrices are retained.
 
-This initial implementation follows the supplied SGLang baseline pipeline.
-It is an optimization over the starter, not a claimed speedup over SGLang.
+Keep Marlin's optimized packed GEMMs, but fuse small-batch route preparation
+and post-expert normalization and use smaller EP8 token tiles. See REPORT.md
+for cold-L2 CUDA-graph measurements against the supplied SGLang baseline.
 """
 
 from types import SimpleNamespace
@@ -75,7 +76,6 @@ class State(TypedDict):
 
 LOCAL_START = 0
 LOCAL_COUNT = 32
-BLOCK_SIZE_M_CANDIDATES = (8, 16, 32, 48, 64)
 POST_NORM_EPS = 1e-8
 
 
@@ -127,11 +127,69 @@ def prepare(weights: Weights) -> State:
 
 
 def _block_size_m(num_tokens: int, top_k: int, local_count: int) -> int:
-    """Use the baseline's shape-only tiling heuristic, including nearby sizes."""
-    for block_size in BLOCK_SIZE_M_CANDIDATES:
-        if num_tokens * top_k / local_count / block_size < 0.9:
-            return block_size
-    return BLOCK_SIZE_M_CANDIDATES[-1]
+    """Measured EP8 tiles: reduce padding without excessive weight rereads."""
+    return 8 if num_tokens <= 32 else 16
+
+
+@triton.jit
+def _small_batch_routes(
+    GlobalIds, LocalIds, Sorted, BlockExperts, Padded,
+    SLOTS: tl.constexpr, LOCAL_START: tl.constexpr, LOCAL_COUNT: tl.constexpr,
+    BM: tl.constexpr, BLOCK_SLOTS: tl.constexpr, BLOCK_EXPERTS: tl.constexpr,
+    BLOCKS_PER_EXPERT: tl.constexpr,
+):
+    """Map, count, prefix-sum and pad a small routing table in one CTA."""
+    slots = tl.arange(0, BLOCK_SLOTS)
+    experts = tl.arange(0, BLOCK_EXPERTS)
+    ids = tl.load(GlobalIds + slots, slots < SLOTS, other=-1) - LOCAL_START
+    local = (ids >= 0) & (ids < LOCAL_COUNT) & (slots < SLOTS)
+    tl.store(LocalIds + slots, tl.where(local, ids, -1), slots < SLOTS)
+    matches = (experts[:, None] == ids[None, :]) & local[None, :]
+    counts = tl.sum(matches.to(tl.int32), 1)
+    padded_counts = tl.cdiv(counts, BM) * BM
+    offsets = tl.cumsum(padded_counts, 0) - padded_counts
+    ranks = tl.cumsum(matches.to(tl.int32), 1) - 1
+    tl.store(Sorted + offsets[:, None] + ranks, slots[None, :], matches)
+    # Padding stores are disjoint from valid-route stores. No scratch clear or
+    # inter-CTA synchronization is required, including the all-nonlocal case.
+    pad = tl.arange(0, BM)
+    tl.store(
+        Sorted + offsets[:, None] + counts[:, None] + pad[None, :], SLOTS,
+        pad[None, :] < (padded_counts - counts)[:, None],
+    )
+    blocks = tl.arange(0, BLOCKS_PER_EXPERT)
+    tl.store(
+        BlockExperts + offsets[:, None] // BM + blocks[None, :], experts[:, None],
+        blocks[None, :] < (padded_counts // BM)[:, None],
+    )
+    tl.store(Padded, tl.sum(padded_counts, 0))
+
+
+def _routes(global_ids, state, block_size):
+    tokens, top_k = global_ids.shape
+    slots = tokens * top_k
+    if tokens > 32:
+        local_ids = state["expert_map"][global_ids.to(torch.int32)].contiguous()
+        sorted_ids, experts, padded = moe_align_block_size(
+            local_ids, block_size, state["local_count"]
+        )
+        return local_ids, sorted_ids, experts, padded
+    device = global_ids.device
+    count = state["local_count"]
+    capacity = triton.cdiv(slots + count * (block_size - 1), block_size) * block_size
+    local_ids = torch.empty((tokens, top_k), device=device, dtype=torch.int32)
+    sorted_ids = torch.empty((capacity,), device=device, dtype=torch.int32)
+    experts = torch.empty((capacity // block_size,), device=device, dtype=torch.int32)
+    padded = torch.empty((1,), device=device, dtype=torch.int32)
+    _small_batch_routes[(1,)](
+        global_ids, local_ids, sorted_ids, experts, padded,
+        SLOTS=slots, LOCAL_START=state["local_start"], LOCAL_COUNT=count,
+        BM=block_size, BLOCK_SLOTS=triton.next_power_of_2(slots),
+        BLOCK_EXPERTS=triton.next_power_of_2(count),
+        BLOCKS_PER_EXPERT=triton.next_power_of_2(triton.cdiv(slots, block_size)),
+        num_warps=4,
+    )
+    return local_ids, sorted_ids, experts, padded
 
 
 @triton.jit
@@ -192,11 +250,10 @@ def kernel_fn(data: Inputs, state: State) -> torch.Tensor:
     size_n = state["d_expert"]
     top_k = cfg["top_k"]
     gemm1_n = 2 * size_n
-    local_ids = state["expert_map"][data["topk_ids"].to(torch.int32)].contiguous()
     topk_weights = data["topk_weights"].to(torch.float32).contiguous()
     block_size_m = _block_size_m(num_tokens, top_k, state["local_count"])
-    sorted_ids, block_experts, n_padded = moe_align_block_size(
-        local_ids, block_size_m, state["local_count"]
+    local_ids, sorted_ids, block_experts, n_padded = _routes(
+        data["topk_ids"].contiguous(), state, block_size_m
     )
 
     # Keep the baseline's scratch aliasing: h is dead once SwiGLU completes,

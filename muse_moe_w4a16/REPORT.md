@@ -1,6 +1,97 @@
+# Improved routed-Marlin pipeline
+
+Branch: `optimize/marlin-local-routing`, based on `optimize/routed-marlin`.
+
+## Motivation and scope
+
+The [H200 NVFP4 streaming notes](https://github.com/MrNirmata/h200-decode-notes/blob/main/notes/03-nvfp4-moe-streaming.md)
+recommend attacking fixed per-call costs at small batch and tuning consumer
+occupancy/tile shapes at larger batch. This change applies those lessons to the
+existing Marlin pipeline instead of replacing its optimized GEMMs.
+
+**This is a faster Marlin-based pipeline, not a new Marlin CUDA implementation.**
+It does not implement the notes' combined 9216-byte weight/scale stages,
+producer-warps, or new dequantization assembly. The installed Marlin Python API
+does not expose its internal `thread_k`, `thread_n`, or occupancy parameters.
+
+## Implemented changes
+
+1. **Fused small-batch routing:** for at most 32 tokens, one Triton CTA maps
+   global expert IDs, counts routes per local expert, computes padded offsets
+   and route ranks, and emits sorted slots, block expert IDs and padded length.
+   Nonlocal blocks are omitted. Valid and padding stores are disjoint. Duplicate
+   expert routes retain their distinct flattened slot IDs. No host reads of
+   route counts or input-derived caching are used.
+2. **Fused small-batch post-expert normalization:** below 32 tokens, replace
+   SGLang's multi-kernel PyTorch fallback with one masked Triton kernel. Each
+   expert is normalized before routing weights are applied; nonlocal scratch
+   is not loaded. Larger batches retain the existing fused SGLang norm kernel.
+3. **EP8-specific token tiles:** use block height 8 through 32 tokens and 16
+   above that, rather than increasing to 48/64 based on all global top-k routes.
+   Smaller tiles reduce excess padded work. Tile 8 for every shape performed
+   worse at the largest batch, so that configuration was rejected.
+4. **Local metadata:** the remaining library alignment path is sized for the
+   32 local experts rather than all 256 global experts.
+
+Packed NVFP4 weights and their scales remain lossless in `prepare()`. Marlin
+still performs both GEMMs with `use_fp32_reduce=True`, `use_atomic_add=False`,
+and BF16 activation/output boundaries. Scratch aliasing is preserved.
+
+## Official measurements
+
+Original routed-Marlin check `efcd6c0b0b5b4110` passed and reported aggregate
+speedup 1.0016 versus the supplied SGLang baseline (effectively identical).
+
+Final executable implementation: off-board check `9f3a1fbf1b484412` on H200,
+all 5 correctness tests and all 6 scored shapes passed. Aggregate speedup:
+**1.3119**, 95% interval **[1.2922, 1.3316]**. Correctness-test relative L2 errors
+were 0.534–0.557%, below the task's 1.5% bound.
+
+| Tokens | Load | Submission time | Paired speedup vs SGLang |
+|---|---|---:|---:|
+| 1 | decode 1 | 48.77 us | 1.591x |
+| 16 | decode 16 | 149.33 us | 1.266x |
+| 32 | decode 32 | 201.11 us | 1.027x |
+| 8 | verify 1 | 107.10 us | 1.339x |
+| 128 | verify 16 | 334.67 us | 1.385x |
+| 256 | verify 32 | 469.04 us | 1.329x |
+
+These are paired cold-L2 CUDA-graph results, not eager timings. Separate check
+runs use different routes/weights and may differ in absolute time. The gain
+at 32 tokens is comparatively small and should not be overinterpreted.
+
+Additional checks:
+- `16aa87685c2247cc`: fused small norm + local metadata, original tile heuristic;
+  aggregate speedup 1.1317.
+- `d93a9445937145c5`: tile height 8 everywhere; aggregate 1.1317.
+- `ae36e309f20744fb`: tile height 16 everywhere; aggregate 1.2286.
+- `7da4e11c75084a4a`: 8 for small batches / 32 for large; aggregate 1.2164.
+- `1f771d82236342af`: compact small routing with 8/32 tiles; aggregate 1.2731.
+- `0509b1571e404ae0`: final 8/16 tiles with non-EP GEMM specialization on the
+  compact route path; aggregate 1.3081. No clear benefit versus retaining EP;
+  rejected to avoid unnecessary specialization.
+
+Reports are under `profiles/submission.<job>.txt`; a compact final result is
+in `results/marlin-local-routing.json`. No scored submission was made.
+
+## Local validation
+
+Six CPU wiring tests pass; Ruff and `git diff --check` pass. The five optional
+CUDA edge-case tests in `test_marlin_gpu.py` cover empty local routes, duplicate
+routes/skew, graph replay with fresh routes, NaN-filled nonlocal scratch, and
+normalization arithmetic. **They skip locally because PyTorch/CUDA is absent**;
+they are not claimed as executed. Official checks above execute the submission
+on GPU, including nearby and skewed test shapes, but are not a substitute for
+running every optional edge test in a configured development environment.
+
+## Historical starter and initial implementation
+
+The remaining sections describe the original PyTorch starter and the previous
+untuned Marlin implementation, not the current performance results.
+
 # Understanding the starter expert loop
 
-This section explains the **original PyTorch starter** loop in `kernel_fn()`. The current `submission.py` replaces that loop with the routed packed-weight pipeline described under [Implemented initial optimization](#implemented-initial-optimization).
+This section explains the **original PyTorch starter** loop in `kernel_fn()`.
 
 Before the loop:
 
