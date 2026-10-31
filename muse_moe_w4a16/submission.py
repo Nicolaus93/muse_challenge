@@ -2817,7 +2817,7 @@ static int g_okc_pdl = 0;  // launch with programmatic stream serialization (PDL
 void okc_set_pdl(int64_t on) { g_okc_pdl = on ? 1 : 0; }
 
 // Host-only metadata from the compiler that builds this CUDA translation unit.
-// No subprocess, device read, or timed-kernel instrumentation is involved.
+// Read once from prepare(); only compile-time constants are returned.
 std::vector<int64_t> okc_compiler_version() {
   return {__CUDACC_VER_MAJOR__, __CUDACC_VER_MINOR__, __CUDACC_VER_BUILD__, CUDART_VERSION};
 }

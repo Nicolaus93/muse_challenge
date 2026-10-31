@@ -80,6 +80,23 @@ Leaderboard at retrieval: **228 of 1256 ranked teams**, up from **1025** for the
 previous Marlin submission (797 places gained). Rankings remain provisional.
 Full scored profile: `profiles/submission.ab48b9ddea894287.txt`.
 
+## Verified judge compiler
+
+Check `e46df99945204d27` compiled a host-only metadata function in the CUDA
+translation unit and printed its constants once from untimed `prepare()`:
+
+```text
+[cuda-toolchain] nvcc=13.0.88 cudart_header=13000
+```
+
+Thus the tested judge uses NVCC **13.0.88**, with CUDA runtime **headers 13.0**.
+The header macro is not a measurement of the installed driver or loaded runtime.
+The function returns `__CUDACC_VER_MAJOR__`, `__CUDACC_VER_MINOR__`,
+`__CUDACC_VER_BUILD__`, and `CUDART_VERSION`; it is never called by `kernel_fn`.
+All official correctness/benchmark cases passed, with no flags or rejections.
+An initial precheck rejected the word `subprocess` in an explanatory comment;
+removing only that comment wording resolved the false positive.
+
 ## Validation
 
 Final off-board H200 check of implementation commit `cabcee2`:
